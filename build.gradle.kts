@@ -2,9 +2,9 @@ import org.gradle.jvm.application.tasks.CreateStartScripts
 
 plugins {
     `java-library`
-    `maven-publish`
     application
     id("com.gradleup.shadow") version "8.3.5"
+    id("com.vanniktech.maven.publish") version "0.37.0"
 }
 
 group = "io.github.tricatch"
@@ -20,8 +20,7 @@ java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(21)
     }
-    withSourcesJar()
-    withJavadocJar()
+    // sources/javadoc jars are produced by the vanniktech publish plugin (see mavenPublishing below)
 }
 
 tasks.withType<Javadoc> {
@@ -143,32 +142,45 @@ tasks.build {
 // shadow" zip/tar artifacts from "archives" here, before `assemble` ever has to realize them.
 configurations.getByName("archives").artifacts.removeIf { it.name == "${project.name}-shadow" }
 
-publishing {
-    publications {
-        create<MavenPublication>("maven") {
-            from(components["java"])
-            pom {
-                name = "oe-proxy"
-                description = "Reverse proxy core (SSL pass-through virtual-host proxy)"
-                url = "https://github.com/tricatch/oeProxy"
-                licenses {
-                    license {
-                        name = "MIT License"
-                        url = "https://opensource.org/licenses/MIT"
-                    }
-                }
-                developers {
-                    developer {
-                        id = "tricatch"
-                        name = "tricatch"
-                    }
-                }
-                scm {
-                    url = "https://github.com/tricatch/oeProxy"
-                    connection = "scm:git:https://github.com/tricatch/oeProxy.git"
-                    developerConnection = "scm:git:https://github.com/tricatch/oeProxy.git"
-                }
+mavenPublishing {
+    publishToMavenCentral()
+    // Sign only when a key is configured, so publishToMavenLocal works on a machine without one.
+    if (providers.gradleProperty("signingInMemoryKey").isPresent) {
+        signAllPublications()
+    }
+    coordinates("io.github.tricatch", "oe-proxy", version.toString())
+
+    pom {
+        name = "oe-proxy"
+        description = "Lightweight Java reverse proxy that terminates HTTPS for many virtual hosts on one port using per-domain certificates signed by your own root CA. Embed it as a library or run it standalone."
+        url = "https://github.com/tricatch/oeProxy"
+        licenses {
+            license {
+                name = "MIT License"
+                url = "https://opensource.org/licenses/MIT"
             }
         }
+        developers {
+            developer {
+                id = "tricatch"
+                name = "tricatch"
+                url = "https://github.com/tricatch"
+            }
+        }
+        scm {
+            url = "https://github.com/tricatch/oeProxy"
+            connection = "scm:git:https://github.com/tricatch/oeProxy.git"
+            developerConnection = "scm:git:https://github.com/tricatch/oeProxy.git"
+        }
+    }
+}
+
+// Signing is skipped above when no key is configured, which keeps publishToMavenLocal usable
+// anywhere - but an unsigned upload to Central would only be rejected later by Portal validation.
+// Fail fast instead when a Central publish task is actually scheduled without a signing key.
+gradle.taskGraph.whenReady {
+    val publishesToCentral = allTasks.any { it.name.contains("MavenCentral") }
+    if (publishesToCentral && !providers.gradleProperty("signingInMemoryKey").isPresent) {
+        throw GradleException("signingInMemoryKey is not set in ~/.gradle/gradle.properties - Maven Central requires signed artifacts")
     }
 }

@@ -141,6 +141,26 @@ HttpEventManager.getInstance().removeEventConsumer(consumer);
   jar. 다른 어떤 것도 클래스패스에 없어도 `java -jar oe-proxy-0.1.0-all.jar`만으로 독립
   실행(standalone) CLI를 바로 쓸 수 있습니다 - 아래 "독립 실행" 절 참고.
 
+## 배포 (Maven Central)
+
+Maven Central(Central Portal) 게시는 vanniktech `com.vanniktech.maven.publish` 플러그인으로 구성되어
+있습니다. 아래 키를 `~/.gradle/gradle.properties`에 설정합니다 (값은 저장소에 절대 커밋하지 않습니다):
+
+- `mavenCentralUsername`
+- `mavenCentralPassword`
+- `signingInMemoryKey`
+- `signingInMemoryKeyId`
+- `signingInMemoryKeyPassword`
+
+```bash
+./gradlew publishToMavenLocal     # ~/.m2에 게시해 POM/jar 내용을 확인 (서명 키 없이도 동작)
+./gradlew publishToMavenCentral   # Central Portal로 서명해서 업로드 (서명 키가 없으면 업로드 전에 실패)
+```
+
+`publishToMavenCentral` 후에는 Central Portal의 Deployments 화면에서 검증 결과를 확인하고 직접
+Release 합니다. 한 번 릴리스된 버전은 수정하거나 삭제할 수 없으므로, 릴리스 전에 반드시
+`publishToMavenLocal` 결과를 확인하세요.
+
 ## 독립 실행 (standalone)
 
 임베딩 애플리케이션 없이도, `oe-proxy` CLI 하나로 (1) 자체 서명 루트 CA를 만들고 (2) 라우팅만
