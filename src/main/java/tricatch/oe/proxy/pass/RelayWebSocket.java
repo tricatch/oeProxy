@@ -1,0 +1,283 @@
+package tricatch.oe.proxy.pass;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import tricatch.oe.proxy.http.io.HttpStream;
+import tricatch.oe.proxy.http.io.HttpStreamReader;
+import tricatch.oe.proxy.http.io.HttpStreamWriter;
+import tricatch.oe.proxy.event.HttpEvent;
+import tricatch.oe.proxy.event.HttpEventManager;
+import tricatch.oe.proxy.event.HttpEventType;
+import java.io.IOException;
+
+/**
+ * Class for handling WebSocket HTTP body relay operations
+ */
+public class RelayWebSocket {
+
+    private static final Logger logger = LoggerFactory.getLogger(RelayWebSocket.class);
+
+    /**
+     * Relay WebSocket frames between HttpStreamReader and HttpStreamWriter
+     * @param clientId Client identifier
+     * @param rid Request ID for logging
+     * @param flow Body stream flow direction (REQ/RES)
+     * @param in Input stream reader
+     * @param out Output stream writer
+     * @return HttpStream.Connection indicating whether connection should be closed
+     * @throws IOException when I/O error occurs
+     */
+    public static HttpStream.Connection relay(String clientId, String rid, HttpStream.Flow flow, HttpStreamReader in, HttpStreamWriter out, boolean monitored) throws IOException {
+        if (logger.isDebugEnabled()) {
+            logger.debug("{}, {}, Relaying WebSocket frames"
+                    , rid
+                    , flow
+            );
+        }
+        
+        while (true) {
+
+            WebSocketFrame frame = readFrame(in);
+            if (frame == null) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("{}, {}, WebSocket frame read returned null - ending relay", rid, flow);
+                }
+                break;
+            }
+
+            logFrame(rid, flow, "READ", frame);
+            writeFrame(out, frame);
+            logFrame(rid, flow, "WRITE", frame);
+
+            // Checked per frame (not once before the loop) since a long-lived socket connection
+            // can outlast a monitor tab opening/closing mid-stream — the lookup itself is a cheap
+            // ConcurrentHashMap.get, far cheaper than the unmask copy it guards.
+            if (HttpEventManager.getInstance().hasSubscriber(clientId)) {
+                byte[] payloadForEvent = frame.getPayload();
+                if (payloadForEvent != null && payloadForEvent.length > 0 && frame.getMaskingKey() != null) {
+                    payloadForEvent = unmaskPayload(payloadForEvent, frame.getMaskingKey());
+                }
+                if (payloadForEvent == null) {
+                    payloadForEvent = new byte[0];
+                }
+
+                HttpEvent frameEvent = new HttpEvent(clientId, rid, HttpEventType.WS_FRAME);
+                frameEvent.setBody(payloadForEvent);
+                frameEvent.setHttpStream(HttpStream.WEBSOCKET);
+                frameEvent.setOpcode(frame.getOpcode());
+                frameEvent.setWsDirection(flow == HttpStream.Flow.REQ ? "REQ" : "RES");
+                HttpEventManager.getInstance().enqueue(frameEvent);
+            }
+
+            if (frame.getOpcode() == 0x8) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("{}, {}, WebSocket close frame received - ending relay", rid, flow);
+                }
+                break;
+            }
+        }
+
+        if (logger.isDebugEnabled()) {
+            logger.debug("{}, {}, WebSocket relay completed", rid, flow);
+        }
+
+        return HttpStream.Connection.CLOSE;
+    }
+
+    public static WebSocketFrame readFrame(HttpStreamReader in) throws IOException {
+
+        int b = in.read();
+
+        if (b == -1) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("WebSocket readFrame: End of stream (first byte)");
+            }
+            return null;
+        }
+
+        int finAndOpcode = b;
+
+        b = in.read();
+        if (b == -1) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("WebSocket readFrame: End of stream (second byte)");
+            }
+            return null;
+        }
+
+        int maskAndPayloadLen = b;
+
+        int payloadLength = maskAndPayloadLen & 0x7F;
+        byte[] extendedPayloadLengthBytes = null;
+
+        if (payloadLength == 126) {
+            extendedPayloadLengthBytes = new byte[2];
+            if (!readFully(in, extendedPayloadLengthBytes)) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("WebSocket readFrame: Failed to read extended payload length (126)");
+                }
+                return null;
+            }
+            payloadLength = ((extendedPayloadLengthBytes[0] & 0xFF) << 8) | (extendedPayloadLengthBytes[1] & 0xFF);
+        } else if (payloadLength == 127) {
+            extendedPayloadLengthBytes = new byte[8];
+            if (!readFully(in, extendedPayloadLengthBytes)) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("WebSocket readFrame: Failed to read extended payload length (127)");
+                }
+                return null;
+            }
+            long length = 0;
+            for (int i = 0; i < 8; i++) {
+                length = (length << 8) | (extendedPayloadLengthBytes[i] & 0xFF);
+            }
+            if (length > Integer.MAX_VALUE) {
+                throw new IOException("Payload too large");
+            }
+            payloadLength = (int) length;
+        }
+
+        if (payloadLength > tricatch.oe.proxy.http.HTTP.MAX_WEBSOCKET_FRAME_LENGTH) {
+            throw new IOException("WebSocket frame payload too large: " + payloadLength);
+        }
+
+        boolean masked = (maskAndPayloadLen & 0x80) != 0;
+        byte[] maskingKey = null;
+
+        if (masked) {
+            maskingKey = new byte[4];
+            if (!readFully(in, maskingKey)) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("WebSocket readFrame: Failed to read masking key");
+                }
+                return null;
+            }
+        }
+
+        byte[] payload = new byte[payloadLength];
+        if (!readFully(in, payload)) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("WebSocket readFrame: End of stream while reading payload (expected: {})", payloadLength);
+            }
+            return null;
+        }
+
+
+
+        return new WebSocketFrame(finAndOpcode, maskAndPayloadLen, extendedPayloadLengthBytes, maskingKey, payload);
+    }
+
+    /**
+     * Fills {@code b} completely. A single read() returns whatever is buffered (possibly fewer bytes
+     * than asked for when a TCP segment ends mid-header), which is not end of stream.
+     * @return false only if the stream ended before {@code b} was full
+     */
+    private static boolean readFully(HttpStreamReader in, byte[] b) throws IOException {
+        int total = 0;
+        while (total < b.length) {
+            int r = in.read(b, total, b.length - total);
+            if (r == -1) return false;
+            total += r;
+        }
+        return true;
+    }
+
+    public static void writeFrame(HttpStreamWriter out, WebSocketFrame frame) throws IOException {
+
+        out.write(frame.getFinAndOpcode());
+        out.write(frame.getMaskAndPayloadLen());
+
+        if (frame.getExtendedPayloadLengthBytes() != null) {
+            out.write(frame.getExtendedPayloadLengthBytes());
+        }
+        if (frame.getMaskingKey() != null) {
+            out.write(frame.getMaskingKey());
+        }
+
+        out.write(frame.getPayload());
+        out.flush();
+    }
+
+    private static void logFrame(String rid, HttpStream.Flow flow, String direction, WebSocketFrame frame) {
+
+        if (!logger.isDebugEnabled()) return;
+
+        int opcode = frame.getOpcode();
+        byte[] payload = frame.getPayload();
+        int length = payload.length;
+
+        logger.debug("{}, {}, WebSocket {} - Opcode: 0x{}, Payload Length: {}, Payload (hex): {}",
+                rid,
+                flow,
+                direction,
+                Integer.toHexString(opcode),
+                length,
+                toHexSummary(payload)
+        );
+    }
+
+    private static String toHexSummary(byte[] data) {
+
+        int limit = Math.min(data.length, 16);
+
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < limit; i++) {
+            sb.append(String.format("%02X", data[i]));
+            if (i < limit - 1) sb.append(" ");
+        }
+
+        if (data.length > 16) sb.append(" ...");
+
+        return sb.toString();
+    }
+
+    private static byte[] unmaskPayload(byte[] payload, byte[] maskingKey) {
+        byte[] result = new byte[payload.length];
+        for (int i = 0; i < payload.length; i++) {
+            result[i] = (byte) (payload[i] ^ maskingKey[i % 4]);
+        }
+        return result;
+    }
+
+    public static class WebSocketFrame {
+        private final int finAndOpcode;
+        private final int maskAndPayloadLen;
+        private final byte[] extendedPayloadLengthBytes;
+        private final byte[] maskingKey;
+        private final byte[] payload;
+
+        public WebSocketFrame(int finAndOpcode, int maskAndPayloadLen, byte[] extendedPayloadLengthBytes, byte[] maskingKey, byte[] payload) {
+            this.finAndOpcode = finAndOpcode;
+            this.maskAndPayloadLen = maskAndPayloadLen;
+            this.extendedPayloadLengthBytes = extendedPayloadLengthBytes;
+            this.maskingKey = maskingKey;
+            this.payload = payload;
+        }
+
+        public int getFinAndOpcode() {
+            return finAndOpcode;
+        }
+
+        public int getMaskAndPayloadLen() {
+            return maskAndPayloadLen;
+        }
+
+        public byte[] getExtendedPayloadLengthBytes() {
+            return extendedPayloadLengthBytes;
+        }
+
+        public byte[] getMaskingKey() {
+            return maskingKey;
+        }
+
+        public byte[] getPayload() {
+            return payload;
+        }
+
+        public int getOpcode() {
+            return finAndOpcode & 0x0F;
+        }
+    }
+}

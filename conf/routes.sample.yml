@@ -1,0 +1,34 @@
+# Sample routes file for `oe-proxy run` (standalone CLI).
+#
+# This is the same `virtual:` routing document embedding-application users write -
+# see tricatch.oe.proxy.cfg.VirtualHost / VirtualDomain / VirtualLocation. It contains ONLY
+# routing - CA files are given on the command line instead, and the proxy always listens on 443:
+#
+#   oe-proxy ca                                   # once, writes ~/oeProxy/root-ca/ca.{cer,pfx}
+#   oe-proxy run ./routes.yml                     # --ca-dir defaults to ~/oeProxy/root-ca
+#
+# virtual:
+#   - domain: app.test              # the hostname clients will request (add it to /etc/hosts
+#                                    # or your DNS pointing at this machine's IP)
+#     location:
+#       - host: http://127.0.0.1:8080   # backend to relay to
+#         path:
+#           - /**                       # ant-style path pattern(s); /** matches everything
+#         # header:                     # optional: request headers to add/remove per location
+#         #   - X-Forwarded-App: app    # "Name: value" adds/overwrites a header
+#         #   - --X-Powered-By          # a "--" prefix removes a header
+#
+#   - domain: api.test
+#     location:
+#       - host: http://127.0.0.1:9090
+#         path:
+#           - /api/**
+#       - host: http://127.0.0.1:9091
+#         path:
+#           - /**
+#
+# Notes:
+# - By default a location's backend must resolve to an internal-network address (loopback,
+#   private, link-local) - pass --allow-external-upstream to `oe-proxy run` to lift this.
+# - Multiple `location` entries for one domain are tried longest-path-first; exact paths are
+#   preferred over "*"-pattern paths.
