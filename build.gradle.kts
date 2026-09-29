@@ -3,6 +3,7 @@ import org.gradle.jvm.application.tasks.CreateStartScripts
 plugins {
     `java-library`
     application
+    signing
     id("com.gradleup.shadow") version "8.3.5"
     id("com.vanniktech.maven.publish") version "0.37.0"
 }
@@ -142,10 +143,15 @@ tasks.build {
 // shadow" zip/tar artifacts from "archives" here, before `assemble` ever has to realize them.
 configurations.getByName("archives").artifacts.removeIf { it.name == "${project.name}-shadow" }
 
+// Artifacts are signed by the local gpg installation (signing.gnupg.* in ~/.gradle/gradle.properties)
+// rather than an in-memory key, so the private key never has to be copied into a properties file and
+// gpg-agent asks for the passphrase through its own pinentry dialog at signing time.
+val signingKeyConfigured = providers.gradleProperty("signing.gnupg.keyName").isPresent
+
 mavenPublishing {
     publishToMavenCentral()
-    // Sign only when a key is configured, so publishToMavenLocal works on a machine without one.
-    if (providers.gradleProperty("signingInMemoryKey").isPresent) {
+    // Sign only when a gpg key is configured, so publishToMavenLocal works on a machine without one.
+    if (signingKeyConfigured) {
         signAllPublications()
     }
     coordinates("io.github.tricatch", "oe-proxy", version.toString())
@@ -175,12 +181,18 @@ mavenPublishing {
     }
 }
 
+if (signingKeyConfigured) {
+    signing {
+        useGpgCmd()
+    }
+}
+
 // Signing is skipped above when no key is configured, which keeps publishToMavenLocal usable
 // anywhere - but an unsigned upload to Central would only be rejected later by Portal validation.
 // Fail fast instead when a Central publish task is actually scheduled without a signing key.
 gradle.taskGraph.whenReady {
     val publishesToCentral = allTasks.any { it.name.contains("MavenCentral") }
-    if (publishesToCentral && !providers.gradleProperty("signingInMemoryKey").isPresent) {
-        throw GradleException("signingInMemoryKey is not set in ~/.gradle/gradle.properties - Maven Central requires signed artifacts")
+    if (publishesToCentral && !signingKeyConfigured) {
+        throw GradleException("signing.gnupg.keyName is not set in ~/.gradle/gradle.properties - Maven Central requires signed artifacts")
     }
 }

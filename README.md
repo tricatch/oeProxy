@@ -148,9 +148,12 @@ Maven Central(Central Portal) 게시는 vanniktech `com.vanniktech.maven.publish
 
 - `mavenCentralUsername`
 - `mavenCentralPassword`
-- `signingInMemoryKey`
-- `signingInMemoryKeyId`
-- `signingInMemoryKeyPassword`
+- `signing.gnupg.executable` — gpg 실행 파일 경로 (예: `C:/Program Files/Git/usr/bin/gpg.exe`)
+- `signing.gnupg.keyName` — 서명에 쓸 키 ID
+
+서명은 로컬에 설치된 gpg가 수행합니다. 비밀키를 properties 파일에 옮겨 둘 필요가 없고, 키 암호는
+서명할 때 gpg-agent의 암호 입력 창(pinentry)으로 묻습니다. `signing.gnupg.keyName`이 없으면 서명을
+건너뜁니다.
 
 ```bash
 ./gradlew publishToMavenLocal     # ~/.m2에 게시해 POM/jar 내용을 확인 (서명 키 없이도 동작)
