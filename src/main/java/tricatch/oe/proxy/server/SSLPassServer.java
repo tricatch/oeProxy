@@ -46,11 +46,13 @@ public class SSLPassServer implements Runnable {
 
             logger.info("{} running...", clazzName);
             logger.info("{} port: {}", clazzName, https.getPort());
+            logger.info("{} bind: {}", clazzName, ReverseProxyServer.getBindAddress() == null ? "*" : ReverseProxyServer.getBindAddress().getHostAddress());
             logger.info("{} client.connect.timeout: {}", clazzName, https.getConnectTimeout() );
             logger.info("{} client.read.timeout: {}", clazzName, https.getReadTimeout() );
 
             SSLServerSocketFactory ssf = ReverseProxyServer.getSslContext().getServerSocketFactory();
-            sslSvrSocket = (SSLServerSocket) ssf.createServerSocket(https.getPort());
+            // Backlog 0 keeps the platform default; a null bind address means every interface.
+            sslSvrSocket = (SSLServerSocket) ssf.createServerSocket(https.getPort(), 0, ReverseProxyServer.getBindAddress());
             sslSvrSocket.setEnabledProtocols(new String[] { "TLSv1.2", "TLSv1.3" });
 
             this.running = true;

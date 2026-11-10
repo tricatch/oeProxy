@@ -420,6 +420,22 @@ public class ReverseProxyServer {
     public static Config getConfig(){
         return config;
     }
+
+    // Local address the HTTPS listener binds to; null (the default) binds every interface.
+    private static volatile java.net.InetAddress bindAddress = null;
+
+    /**
+     * Sets the local address startSslPassServer() binds the HTTPS listener to, e.g. the loopback
+     * address to accept connections from this machine only. Null (the default) binds every
+     * interface. Takes effect on the next startSslPassServer().
+     */
+    public static void setBindAddress(java.net.InetAddress address) {
+        bindAddress = address;
+    }
+
+    public static java.net.InetAddress getBindAddress() {
+        return bindAddress;
+    }
     public static SSLContext getSslContext(){
         return sslContext;
     }

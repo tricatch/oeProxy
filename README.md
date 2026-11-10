@@ -39,6 +39,13 @@ ReverseProxyServer.setVirtualHosts(userNo, virtualHostsConfigYaml);
 세 가지 런타임 토글(`ipIdentifierEnabled`, `trustInternalCertEnabled`, `internalOnlyUpstream`)은
 메모리에만 존재하는 단순 getter/setter이며, 영속화는 임베딩 애플리케이션의 몫입니다.
 
+HTTPS 리스너가 바인딩할 로컬 주소는 `startSslPassServer()` 전에 지정할 수 있습니다. 기본값(`null`)은
+모든 인터페이스이며, 이 PC에서 오는 연결만 받으려면 루프백 주소를 넘깁니다:
+
+```java
+ReverseProxyServer.setBindAddress(InetAddress.getLoopbackAddress()); // null이면 모든 인터페이스
+```
+
 ## 오너 식별 헤더
 
 여러 오너를 다루는 임베딩 애플리케이션은 요청마다 오너를 식별하는 HTTP 헤더를 붙여 보냅니다.
