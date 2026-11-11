@@ -9,7 +9,7 @@
 
 ```kotlin
 dependencies {
-    implementation("io.github.tricatch:oe-proxy:0.1.1")
+    implementation("io.github.tricatch:oe-proxy:0.2.0")
 }
 ```
 
@@ -141,11 +141,11 @@ HttpEventManager.getInstance().removeEventConsumer(consumer);
 
 `./gradlew build`는 `build/libs/`에 서로 용도가 다른 두 개의 jar를 만듭니다:
 
-- `oe-proxy-0.1.1.jar` - 의존성 미포함, 라이브러리용. 이 프로젝트 자신의 클래스만 담고 있으며
+- `oe-proxy-0.2.0.jar` - 의존성 미포함, 라이브러리용. 이 프로젝트 자신의 클래스만 담고 있으며
   의존성은 POM(또는 Gradle module metadata)을 통해 해석됩니다. Maven Central에 게시되는
   대상은 이 jar 하나뿐입니다.
-- `oe-proxy-0.1.1-all.jar` - 모든 런타임 의존성(slf4j-simple 포함)을 담은 자체 실행형(fat)
-  jar. 다른 어떤 것도 클래스패스에 없어도 `java -jar oe-proxy-0.1.1-all.jar`만으로 독립
+- `oe-proxy-0.2.0-all.jar` - 모든 런타임 의존성(slf4j-simple 포함)을 담은 자체 실행형(fat)
+  jar. 다른 어떤 것도 클래스패스에 없어도 `java -jar oe-proxy-0.2.0-all.jar`만으로 독립
   실행(standalone) CLI를 바로 쓸 수 있습니다 - 아래 "독립 실행" 절 참고.
 
 ## 배포 (Maven Central)
@@ -318,12 +318,12 @@ build/install/oe-proxy/bin/oe-proxy run ./routes.yml
 
 ### 4. `java -jar`로 직접 실행
 
-`./gradlew installDist` 없이, 위 "빌드 결과물"의 `oe-proxy-0.1.1-all.jar` 하나만으로도 동일하게
+`./gradlew installDist` 없이, 위 "빌드 결과물"의 `oe-proxy-0.2.0-all.jar` 하나만으로도 동일하게
 동작합니다 (slf4j-simple을 포함한 모든 의존성이 이미 jar 안에 들어 있습니다):
 
 ```bash
-java -Djava.net.preferIPv4Stack=true -jar build/libs/oe-proxy-0.1.1-all.jar ca ./conf
-java -Djava.net.preferIPv4Stack=true -jar build/libs/oe-proxy-0.1.1-all.jar run ./conf/routes.sample.yml
+java -Djava.net.preferIPv4Stack=true -jar build/libs/oe-proxy-0.2.0-all.jar ca ./conf
+java -Djava.net.preferIPv4Stack=true -jar build/libs/oe-proxy-0.2.0-all.jar run ./conf/routes.sample.yml
 ```
 
 `-Djava.net.preferIPv4Stack=true`는 `installDist`로 만든 시작 스크립트가 항상 전달하는 옵션과
