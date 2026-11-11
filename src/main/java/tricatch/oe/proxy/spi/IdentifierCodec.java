@@ -2,7 +2,7 @@ package tricatch.oe.proxy.spi;
 
 /**
  * Encodes/decodes the owner identifier carried in the reverse proxy's identifier header (see
- * {@code ReverseProxyServer.getIdentifierHeaderName}) and used as the routing key for an owner's
+ * {@code ReverseProxyServer.setIdentifierHeaderName}; no header is read until a name is set) and used as the routing key for an owner's
  * virtual hosts. Registered via {@code ReverseProxyServer.setIdentifierCodec}.
  *
  * The library ships {@link PlainIdentifierCodec} as the default, which trusts the header value

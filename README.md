@@ -49,16 +49,16 @@ ReverseProxyServer.setBindAddress(InetAddress.getLoopbackAddress()); // null이�
 ## 오너 식별 헤더
 
 여러 오너를 다루는 임베딩 애플리케이션은 요청마다 오너를 식별하는 HTTP 헤더를 붙여 보냅니다.
-기본 헤더 이름은 `ReverseProxyServer.DEFAULT_IDENTIFIER_HEADER`(`X-Oe-Identifier`)이며,
-임베딩 애플리케이션이 이미 자체적으로 쓰고 있는 헤더 이름이 따로 있다면
-`ReverseProxyServer.setIdentifierHeaderName(String)`으로 바꿀 수 있습니다:
+라이브러리에는 기본 헤더 이름이 없습니다. 임베딩 애플리케이션이
+`ReverseProxyServer.setIdentifierHeaderName(String)`으로 자신이 쓰는 헤더 이름을 지정해야 하며,
+지정하기 전에는 식별 헤더를 전혀 읽지 않습니다(IP 클레임이나 기본 오너로만 식별):
 
 ```java
 ReverseProxyServer.setIdentifierHeaderName("X-My-App-Owner");
 ```
 
-헤더 이름은 `null`이거나 공백일 수 없으며, 대소문자 구분 없이 매칭됩니다. 잘못된 값이 온 경우의
-오류 메시지에도 현재 설정된 헤더 이름이 그대로 노출됩니다(`getIdentifierHeaderName()`).
+헤더 이름은 공백일 수 없고 대소문자 구분 없이 매칭되며, `null`을 넘기면 다시 읽지 않는 상태가 됩니다.
+잘못된 값이 온 경우의 오류 메시지에도 현재 설정된 헤더 이름이 그대로 노출됩니다(`getIdentifierHeaderName()`).
 
 독립 실행(standalone) 모드는 단일 소유자 모드이므로 이 헤더를 전혀 쓰지 않습니다 - 모든 요청이
 `ReverseProxyServer.setDefaultOwner`로 지정된 단 하나의 오너로 해석됩니다.

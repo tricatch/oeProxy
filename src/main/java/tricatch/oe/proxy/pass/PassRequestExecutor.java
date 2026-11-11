@@ -235,8 +235,10 @@ public class PassRequestExecutor implements Stopable {
                 String cookieHeader = requestHeaders.getHeaderValueAsString(HTTP.HEADER.COOKIE);
                 this.clientHints = new ClientHints(cookieHeader, acceptLanguage);
 
-                this.identifierHeader = requestHeaders.getHeaderValueAsString(
-                        ReverseProxyServer.getIdentifierHeaderName().getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                // No header name set (see ReverseProxyServer.setIdentifierHeaderName): no identifier header is read.
+                String identifierHeaderName = ReverseProxyServer.getIdentifierHeaderName();
+                this.identifierHeader = identifierHeaderName == null ? null : requestHeaders.getHeaderValueAsString(
+                        identifierHeaderName.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
                 // An explicit header (e.g. the oeOID extension) still wins - the self-loop
                 // registration only fills in for the common case where forward-proxied HTTPS
                 // traffic carries no header at all (see SelfLoopOwnerRegistry and the field

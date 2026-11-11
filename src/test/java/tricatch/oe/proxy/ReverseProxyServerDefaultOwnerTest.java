@@ -28,7 +28,7 @@ class ReverseProxyServerDefaultOwnerTest {
     void resetState() {
         ReverseProxyServer.setDefaultOwner(null);
         ReverseProxyServer.clearVirtualHosts(OWNER);
-        ReverseProxyServer.setIdentifierHeaderName(ReverseProxyServer.DEFAULT_IDENTIFIER_HEADER);
+        ReverseProxyServer.setIdentifierHeaderName(null);
         ReverseProxyServer.setIdentifierCodec(new PlainIdentifierCodec());
     }
 
@@ -57,7 +57,21 @@ class ReverseProxyServerDefaultOwnerTest {
 
         assertThatThrownBy(() -> ReverseProxyServer.getVirtualHosts("203.0.113.5", "not-a-valid-identifier"))
                 .isInstanceOf(NotFoundProxyVirtualHostsException.class)
-                .hasMessageContaining("Invalid " + ReverseProxyServer.DEFAULT_IDENTIFIER_HEADER + " header");
+                .hasMessageContaining("Invalid identifier header");
+    }
+
+    @Test
+    void identifierHeaderName_isUnsetByDefault_andNullUnsetsIt() {
+        assertThat(ReverseProxyServer.getIdentifierHeaderName()).isNull();
+
+        ReverseProxyServer.setIdentifierHeaderName(" X-Custom-Identifier ");
+        assertThat(ReverseProxyServer.getIdentifierHeaderName()).isEqualTo("X-Custom-Identifier");
+
+        ReverseProxyServer.setIdentifierHeaderName(null);
+        assertThat(ReverseProxyServer.getIdentifierHeaderName()).isNull();
+
+        assertThatThrownBy(() -> ReverseProxyServer.setIdentifierHeaderName("  "))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
@@ -99,7 +113,7 @@ class ReverseProxyServerDefaultOwnerTest {
 
         assertThatThrownBy(() -> ReverseProxyServer.getVirtualHosts("203.0.113.5", "not-magic-token"))
                 .isInstanceOf(NotFoundProxyVirtualHostsException.class)
-                .hasMessageContaining("Invalid " + ReverseProxyServer.DEFAULT_IDENTIFIER_HEADER + " header");
+                .hasMessageContaining("Invalid identifier header");
 
         assertThat(ReverseProxyServer.resolveIdentifier("203.0.113.5", "magic-token")).isEqualTo("owner-0");
     }

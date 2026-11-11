@@ -59,24 +59,26 @@ public class ReverseProxyServer {
     // shared/NATed and unreliable.
     private static volatile boolean ipIdentifierEnabled = false;
 
-    /** The header name used when no embedding application has called {@link #setIdentifierHeaderName}. */
-    public static final String DEFAULT_IDENTIFIER_HEADER = "X-Oe-Identifier";
-
     // The wire-level header name the embedding application sends the request owner's identifier
-    // in. Configurable because different embedding applications may already have their own
-    // established header name (see PassRequestExecutor, which reads this header at request time).
-    private static volatile String identifierHeaderName = DEFAULT_IDENTIFIER_HEADER;
+    // in (see PassRequestExecutor, which reads this header at request time). There is no default
+    // name: until the embedding application names its own header, no identifier header is read
+    // at all, and requests are identified only by a claimed IP or the default owner.
+    private static volatile String identifierHeaderName = null;
 
+    /** The identifier header name, or null when none is set (no identifier header is read). */
     public static String getIdentifierHeaderName() {
         return identifierHeaderName;
     }
 
-    /** Sets the identifier header name the embedding application sends; must be non-null and non-blank. */
+    /**
+     * Sets the identifier header name the embedding application sends; null stops reading an
+     * identifier header (the initial state). A non-null name must not be blank.
+     */
     public static void setIdentifierHeaderName(String name) {
-        if (name == null || name.isBlank()) {
-            throw new IllegalArgumentException("Identifier header name must not be null or blank");
+        if (name != null && name.isBlank()) {
+            throw new IllegalArgumentException("Identifier header name must not be blank");
         }
-        identifierHeaderName = name.trim();
+        identifierHeaderName = name == null ? null : name.trim();
     }
 
     // Encodes/decodes the owner identifier carried in the identifier header and used as the
@@ -388,7 +390,8 @@ public class ReverseProxyServer {
         // The IP-based fallback itself can be turned off entirely via settings when
         // IP identification is untrustworthy (see ipIdentifierEnabled).
         if (identifierHeader != null && !identifierHeader.isBlank() && identifierCodec.decode(identifierHeader) == null) {
-            throw new NotFoundProxyVirtualHostsException("Invalid " + getIdentifierHeaderName() + " header: " + identifierHeader);
+            String name = getIdentifierHeaderName();
+            throw new NotFoundProxyVirtualHostsException("Invalid " + (name == null ? "identifier" : name) + " header: " + identifierHeader);
         }
         String identifier = resolveIdentifier(clientIp, identifierHeader);
         if (identifier == null) throw new NotFoundProxyVirtualHostsException("No owner mapped for IP: " + clientIp);
