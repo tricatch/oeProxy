@@ -205,7 +205,8 @@ public class ReverseProxyServer {
 
     private static Config config = null;
     private static SSLContext sslContext = null;
-    private static SSLPassServer sslPassServer = null;
+    // One HTTPS listener per bind address (a single one on every interface by default).
+    private static final java.util.List<SSLPassServer> sslPassServers = new java.util.ArrayList<>();
 
     static {
 
@@ -261,28 +262,39 @@ public class ReverseProxyServer {
 
         initSslContext();
 
-        if( sslPassServer!=null ){
+        if( !sslPassServers.isEmpty() ){
 
             logger.info("Restart {}", SSLPassServer.class.getSimpleName());
 
             VThreadExecutor.stopAll();
-            sslPassServer.stop();
+            for (SSLPassServer s : sslPassServers) s.stop();
 
             for(int i=0;i<10;i++){
                 Thread.sleep(1000);
-                RunState runState = sslPassServer.getRunState();
-                if( RunState.STOPPED == runState ){
+                boolean allStopped = true;
+                for (SSLPassServer s : sslPassServers) {
+                    if (RunState.STOPPED != s.getRunState()) allStopped = false;
+                }
+                if( allStopped ){
                     break;
                 }
             }
+            sslPassServers.clear();
 
         } else {
 
             logger.info("Start {}", SSLPassServer.class.getSimpleName());
         }
 
-        sslPassServer = new SSLPassServer();
-        serverExecutor.execute(sslPassServer);
+        // No bind address: one listener on every interface (null); otherwise one per address.
+        java.util.List<java.net.InetAddress> addresses = bindAddresses;
+        java.util.List<java.net.InetAddress> targets = new java.util.ArrayList<>(addresses);
+        if (targets.isEmpty()) targets.add(null);
+        for (java.net.InetAddress address : targets) {
+            SSLPassServer s = new SSLPassServer(address);
+            sslPassServers.add(s);
+            serverExecutor.execute(s);
+        }
     }
 
 
@@ -424,20 +436,40 @@ public class ReverseProxyServer {
         return config;
     }
 
-    // Local address the HTTPS listener binds to; null (the default) binds every interface.
-    private static volatile java.net.InetAddress bindAddress = null;
+    // Local addresses the HTTPS listeners bind to; empty (the default) binds every interface.
+    private static volatile java.util.List<java.net.InetAddress> bindAddresses = java.util.List.of();
 
     /**
      * Sets the local address startSslPassServer() binds the HTTPS listener to, e.g. the loopback
      * address to accept connections from this machine only. Null (the default) binds every
-     * interface. Takes effect on the next startSslPassServer().
+     * interface. Takes effect on the next startSslPassServer(). Same as
+     * {@code setBindAddresses(address)}.
      */
     public static void setBindAddress(java.net.InetAddress address) {
-        bindAddress = address;
+        bindAddresses = address == null ? java.util.List.of() : java.util.List.of(address);
     }
 
+    /**
+     * Sets several local addresses, one HTTPS listener each, e.g. the loopback address and one
+     * network card's address to accept connections from this machine and from that network only.
+     * No address (or null) binds every interface, the default. Null entries are ignored and
+     * duplicates bound once. Takes effect on the next startSslPassServer().
+     */
+    public static void setBindAddresses(java.net.InetAddress... addresses) {
+        java.util.LinkedHashSet<java.net.InetAddress> set = new java.util.LinkedHashSet<>();
+        if (addresses != null) for (java.net.InetAddress a : addresses) if (a != null) set.add(a);
+        bindAddresses = java.util.List.copyOf(set);
+    }
+
+    /** The first bind address, or null when the listener binds every interface. */
     public static java.net.InetAddress getBindAddress() {
-        return bindAddress;
+        java.util.List<java.net.InetAddress> a = bindAddresses;
+        return a.isEmpty() ? null : a.get(0);
+    }
+
+    /** Every bind address; empty when the listener binds every interface. */
+    public static java.util.List<java.net.InetAddress> getBindAddresses() {
+        return bindAddresses;
     }
     public static SSLContext getSslContext(){
         return sslContext;

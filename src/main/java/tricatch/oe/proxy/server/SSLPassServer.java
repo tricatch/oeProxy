@@ -19,8 +19,17 @@ public class SSLPassServer implements Runnable {
     private RunState runState = RunState.INIT;
     private boolean running = true;
     private SSLServerSocket sslSvrSocket = null;
+    /** The local address to listen on; null means every interface. */
+    private final java.net.InetAddress bindAddress;
 
+    /** A listener on every interface. */
     public SSLPassServer() {
+        this(null);
+    }
+
+    /** A listener on {@code bindAddress}, or on every interface when it is null. */
+    public SSLPassServer(java.net.InetAddress bindAddress) {
+        this.bindAddress = bindAddress;
     }
 
     public void stop(){
@@ -40,19 +49,19 @@ public class SSLPassServer implements Runnable {
 
         try {
 
-            Thread.currentThread().setName("pt-https-pass");
+            Thread.currentThread().setName(bindAddress == null ? "pt-https-pass" : "pt-https-pass-" + bindAddress.getHostAddress());
 
             Https https = config.getHttps();
 
             logger.info("{} running...", clazzName);
             logger.info("{} port: {}", clazzName, https.getPort());
-            logger.info("{} bind: {}", clazzName, ReverseProxyServer.getBindAddress() == null ? "*" : ReverseProxyServer.getBindAddress().getHostAddress());
+            logger.info("{} bind: {}", clazzName, bindAddress == null ? "*" : bindAddress.getHostAddress());
             logger.info("{} client.connect.timeout: {}", clazzName, https.getConnectTimeout() );
             logger.info("{} client.read.timeout: {}", clazzName, https.getReadTimeout() );
 
             SSLServerSocketFactory ssf = ReverseProxyServer.getSslContext().getServerSocketFactory();
             // Backlog 0 keeps the platform default; a null bind address means every interface.
-            sslSvrSocket = (SSLServerSocket) ssf.createServerSocket(https.getPort(), 0, ReverseProxyServer.getBindAddress());
+            sslSvrSocket = (SSLServerSocket) ssf.createServerSocket(https.getPort(), 0, bindAddress);
             sslSvrSocket.setEnabledProtocols(new String[] { "TLSv1.2", "TLSv1.3" });
 
             this.running = true;

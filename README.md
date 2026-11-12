@@ -46,6 +46,14 @@ HTTPS 리스너가 바인딩할 로컬 주소는 `startSslPassServer()` 전에 �
 ReverseProxyServer.setBindAddress(InetAddress.getLoopbackAddress()); // null이면 모든 인터페이스
 ```
 
+여러 주소에서 받으려면 `setBindAddresses`로 주소마다 리스너를 엽니다(0.3.0부터). 예를 들어 이 PC와
+한 네트워크 카드의 네트워크에서만 받으려면 루프백 주소와 그 카드의 주소를 함께 넘깁니다. 주소를 넘기지 않으면
+기본값처럼 모든 인터페이스에서 받습니다:
+
+```java
+ReverseProxyServer.setBindAddresses(InetAddress.getLoopbackAddress(), InetAddress.getByName("192.168.1.23"));
+```
+
 ## 오너 식별 헤더
 
 여러 오너를 다루는 임베딩 애플리케이션은 요청마다 오너를 식별하는 HTTP 헤더를 붙여 보냅니다.
