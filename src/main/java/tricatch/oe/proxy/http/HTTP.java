@@ -4,7 +4,12 @@ public class HTTP {
 
     public static final int INIT_HEADER_LINES = 10;
     public static final int INIT_HEADER_LENGTH = 256;
-    public static final int MAX_HEADER_LENGTH = 8 * 1024;
+    /** Upper bound on one header line (and on the request/status line). */
+    public static final int MAX_HEADER_LENGTH = 64 * 1024;
+    /** Upper bound on a whole header block. */
+    public static final int MAX_HEADER_BLOCK_LENGTH = 256 * 1024;
+    /** Upper bound on the number of lines in a header block. */
+    public static final int MAX_HEADER_LINES = 1000;
     public static final int BODY_BUFFER_SIZE = 16 * 1024;
     /** Monitor body display limit (1MB). Bodies exceeding this are not collected for monitor. */
     public static final int MONITOR_BODY_LIMIT = 1024 * 1024;

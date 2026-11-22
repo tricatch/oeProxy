@@ -62,6 +62,12 @@ public class HtmlUtil {
         writeHtml(out, "HTTP/1.1 400 Bad Request\r\n", html);
     }
 
+    /** Writes a plain 421 for a request whose Host is not the name its connection was opened for. */
+    public static void writeMisdirectedRequestResponse(HttpStreamWriter out, String reason) throws IOException {
+        String html = "<html><body><h1>421 Misdirected Request</h1><p>" + escapeHtml(reason) + "</p></body></html>";
+        writeHtml(out, "HTTP/1.1 421 Misdirected Request\r\n", html);
+    }
+
     @FunctionalInterface
     private interface RenderCall {
         String render(ErrorPageRenderer renderer);

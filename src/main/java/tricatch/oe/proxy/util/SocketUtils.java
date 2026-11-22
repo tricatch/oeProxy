@@ -83,9 +83,10 @@ public class SocketUtils {
                 throw new IOException(e);
             }
 
-            // autoClose=false: closing the SSLSocket layer below does not close tcpSocket, so
-            // both must be closed explicitly on failure.
-            socket = sc.getSocketFactory().createSocket(tcpSocket, domain, endpoint.getPort(), false);
+            // autoClose=true: callers only hold the SSLSocket, so closing it must close tcpSocket too.
+            // Without it close() leaves the TCP connection open and keeps draining it until the peer
+            // answers close_notify, which a streaming backend may never do.
+            socket = sc.getSocketFactory().createSocket(tcpSocket, domain, endpoint.getPort(), true);
 
             ((SSLSocket) socket).startHandshake();
 

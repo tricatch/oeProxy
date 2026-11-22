@@ -58,6 +58,10 @@ public class MultiDomainCertKeyManager extends X509ExtendedKeyManager {
 
         //Get host name from SSL handshake
         ExtendedSSLSession session = (ExtendedSSLSession) sslSocket.getHandshakeSession();
+        // JDK 25 also asks while it restores a TLS 1.2 session ticket, when no handshake session
+        // exists yet. "None" makes it run a full handshake instead; an exception here would fail
+        // every reconnect of such a client.
+        if (session == null) return null;
         String domain = null;
         for (SNIServerName name : session.getRequestedServerNames()) {
             if (name.getType() == StandardConstants.SNI_HOST_NAME) {

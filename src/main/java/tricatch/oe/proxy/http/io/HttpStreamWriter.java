@@ -23,6 +23,7 @@ public class HttpStreamWriter implements Closeable {
     private final OutputStream out;
     private final byte[] buf;
     private int count = 0;
+    private volatile long lastFlushNanos = System.nanoTime();
 
     public HttpStreamWriter(OutputStream out) {
         this.out = out;
@@ -59,6 +60,12 @@ public class HttpStreamWriter implements Closeable {
     public void flush() throws IOException {
         flushBuffer();
         out.flush();
+        lastFlushNanos = System.nanoTime();
+    }
+
+    /** {@link System#nanoTime()} of the last completed flush, i.e. of the last progress made sending. */
+    public long getLastFlushNanos() {
+        return lastFlushNanos;
     }
 
     public void close() throws IOException {

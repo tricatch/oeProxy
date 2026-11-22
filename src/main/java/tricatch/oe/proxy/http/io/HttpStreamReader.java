@@ -41,6 +41,14 @@ public class HttpStreamReader implements Closeable {
         return count;
     }
 
+    /**
+     * Blocks until a byte is buffered or the stream ends, consuming nothing, so a caller can
+     * safely repeat it after a SocketTimeoutException.
+     */
+    public void awaitData() throws IOException {
+        if (pos >= count) fill();
+    }
+
     public int read() throws IOException {
         if (pos >= count) {
             if (fill() == -1) return -1;
@@ -191,6 +199,11 @@ public class HttpStreamReader implements Closeable {
             // Check if this is an empty line (end of headers)
             if (bytesRead == 0) {
                 break;
+            }
+
+            if (totalBytesRead > HTTP.MAX_HEADER_BLOCK_LENGTH || headers.size() >= HTTP.MAX_HEADER_LINES) {
+                throw new MaxBufferExceedException("header block too large - max=" + HTTP.MAX_HEADER_BLOCK_LENGTH
+                        + " bytes, " + HTTP.MAX_HEADER_LINES + " lines");
             }
 
             // Add header line directly to the list

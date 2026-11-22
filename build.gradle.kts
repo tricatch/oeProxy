@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "io.github.tricatch"
-version = "0.3.0"
+version = "0.3.1"
 
 application {
     mainClass.set("tricatch.oe.proxy.standalone.OeProxyMain")
@@ -46,7 +46,7 @@ dependencies {
     implementation("org.yaml:snakeyaml:2.5")
     api("com.fasterxml.jackson.core:jackson-databind:2.22.2")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.22.2")
-    api("io.github.tricatch:gotpache-keytool:0.1.0")
+    api("io.github.tricatch:gotpache-keytool:0.1.1")
     implementation("org.bouncycastle:bcprov-jdk18on:1.85")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.85")
     implementation("org.bouncycastle:bcutil-jdk18on:1.85")

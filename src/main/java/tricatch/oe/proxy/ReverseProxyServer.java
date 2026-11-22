@@ -14,6 +14,7 @@ import tricatch.oe.proxy.cfg.VirtualHost;
 import tricatch.oe.proxy.exception.ConfigException;
 import tricatch.oe.proxy.exception.NotFoundProxyVirtualHostsException;
 import tricatch.oe.proxy.server.VirtualHosts;
+import tricatch.oe.proxy.spi.DefaultRouteResolver;
 import tricatch.oe.proxy.spi.ErrorPageRenderer;
 import tricatch.oe.proxy.spi.IdentifierCodec;
 import tricatch.oe.proxy.spi.PlainIdentifierCodec;
@@ -169,6 +170,23 @@ public class ReverseProxyServer {
         return errorPageRenderer;
     }
 
+    // Where a loopback client's request goes when its domain has no virtual host. Null (the
+    // default) keeps the proxy strictly vhost-only.
+    private static volatile DefaultRouteResolver defaultRouteResolver = null;
+
+    /** The registered default-route SPI, or null when there is none (the default). */
+    public static DefaultRouteResolver getDefaultRouteResolver() {
+        return defaultRouteResolver;
+    }
+
+    /**
+     * Registers the SPI that routes domains without a virtual host; null removes it. See
+     * {@link DefaultRouteResolver} for the rules the library enforces around it.
+     */
+    public static void setDefaultRouteResolver(DefaultRouteResolver resolver) {
+        defaultRouteResolver = resolver;
+    }
+
     /**
      * Rejects a config whose backend resolves, right now, to an address outside the internal
      * network while that restriction is on. A name that does not resolve yet is let through (a
@@ -299,6 +317,10 @@ public class ReverseProxyServer {
 
 
     public static void setVirtualHosts(Long userNo, String virtualHostsConfigYaml) throws MalformedURLException {
+        applyVirtualHosts(userNo, virtualHostsConfigYaml);
+    }
+
+    private static VirtualHosts applyVirtualHosts(Long userNo, String virtualHostsConfigYaml) throws MalformedURLException {
 
         Representer representer = new Representer(new DumperOptions());
         representer.getPropertyUtils().setSkipMissingProperties(true);
@@ -320,6 +342,7 @@ public class ReverseProxyServer {
         var converted = VirtualHostUtil.convert(virtualHost.getVirtual());
         requireInternalUpstreams(converted, internalOnlyUpstream);
         identifierVirtualHostsMap.put(identifier, converted);
+        return converted;
     }
 
     // Drops only the routing table. An IP claim is a deliberate, user-initiated action (see
@@ -411,24 +434,29 @@ public class ReverseProxyServer {
         if (virtualHosts == null) {
             virtualHosts = reloadVirtualHosts(clientIp, identifier);
         }
-        if (virtualHosts == null) throw new NotFoundProxyVirtualHostsException("No virtual hosts configured for owner: " + identifier);
         return virtualHosts;
     }
 
     // A server restart clears identifierVirtualHostsMap, so the first request from an owner who
     // hasn't re-logged-in or re-saved yet would otherwise fail with NotFoundProxyVirtualHostsException.
     // Rebuild that owner's entry on demand via the registered VirtualHostsLoader instead.
-    private static VirtualHosts reloadVirtualHosts(String clientIp, String identifier) {
+    private static VirtualHosts reloadVirtualHosts(String clientIp, String identifier) throws NotFoundProxyVirtualHostsException {
+        String message = "No virtual hosts configured for owner: " + identifier;
         Long userNo = identifierCodec.decode(identifier);
-        if (userNo == null || virtualHostsLoader == null) return null;
+        if (userNo == null) throw new NotFoundProxyVirtualHostsException(message);
+        VirtualHostsLoader loader = virtualHostsLoader;
         try {
-            var yaml = virtualHostsLoader.load(userNo, clientIp);
-            if (yaml == null || yaml.isBlank()) return null;
-            setVirtualHosts(userNo, yaml);
-            return identifierVirtualHostsMap.get(identifier);
+            var yaml = loader == null ? null : loader.load(userNo, clientIp);
+            // Only this case may use a default route. A table that failed to load must not: the
+            // domains it was meant to send to dev backends would go to the real sites instead.
+            if (yaml == null || yaml.isBlank()) throw NotFoundProxyVirtualHostsException.noneConfigured(message);
+            // Not read back from the map: a concurrent invalidate would make it look unconfigured.
+            return applyVirtualHosts(userNo, yaml);
+        } catch (NotFoundProxyVirtualHostsException e) {
+            throw e;
         } catch (Exception e) {
             logger.warn("Failed to lazily reload virtual hosts for owner {}: {}", identifier, e.getMessage());
-            return null;
+            throw new NotFoundProxyVirtualHostsException(message);
         }
     }
 

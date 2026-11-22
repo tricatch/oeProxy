@@ -100,6 +100,12 @@ public class RelayChunked {
                     }
 
                     if( bytesRead>0 ){
+                        // As in the chunk-size line: a bare CR could end the body early for the backend.
+                        if( containsCarriageReturn(chunkTrailerBuffer.getBuffer(), bytesRead) ){
+                            logger.warn("{}, {}, CR inside a chunk trailer line", rid, flow);
+                            truncated = true;
+                            break;
+                        }
                         if( logger.isDebugEnabled() ){
                             logger.debug("{}, {}, Chunk trailer: {}"
                                     , rid
@@ -195,11 +201,20 @@ public class RelayChunked {
         return truncated ? HttpStream.Connection.CLOSE : HttpStream.Connection.KEEP_ALIVE;
     }
 
+    private static boolean containsCarriageReturn(byte[] buf, int len) {
+        for (int i = 0; i < len; i++) {
+            if (buf[i] == '\r') return true;
+        }
+        return false;
+    }
+
     private static int parseHexChunkSize(byte[] buf, int len) {
         int end = len;
         for (int i = 0; i < len; i++) {
             byte b = buf[i];
-            if (b == ';' || b == '\r' || b == '\n') { end = i; break; }
+            // The line is forwarded as it is, and a backend may take a bare CR for its end.
+            if (b == '\r') throw new NumberFormatException("CR inside the chunk-size line");
+            if ((b == ';' || b == '\n') && end == len) end = i;
         }
         int start = 0;
         while (start < end && buf[start] == ' ') start++;

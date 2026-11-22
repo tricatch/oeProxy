@@ -151,26 +151,30 @@ public class HeaderLines extends ArrayList<ByteBuffer> {
         add(new ByteBuffer(headerLine.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
     
+    private static final int MAX_METHOD_LENGTH = 32;
+
     /**
-     * Check if HTTP method is valid
+     * Check if HTTP method is valid: an upper-case token, which covers the standard methods and
+     * extensions such as PROPFIND. Lower case stays rejected, since methods are case-sensitive and
+     * the framing decisions here compare them exactly.
      * @param method HTTP method to validate
      * @return true if method is valid
      */
     private boolean isValidHttpMethod(String method) {
-        if (method == null || method.isEmpty()) {
+        if (method == null || method.isEmpty() || method.length() > MAX_METHOD_LENGTH) {
             return false;
         }
-        
-        // Standard HTTP methods
-        return "GET".equals(method) || 
-               "POST".equals(method) || 
-               "PUT".equals(method) || 
-               "DELETE".equals(method) || 
-               "HEAD".equals(method) || 
-               "OPTIONS".equals(method) || 
-               "TRACE".equals(method) || 
-               "CONNECT".equals(method) || 
-               "PATCH".equals(method);
+        // "PRI * HTTP/2.0" is the HTTP/2 preface, which this HTTP/1.1 proxy cannot speak.
+        if ("PRI".equals(method) || method.charAt(0) < 'A' || method.charAt(0) > 'Z') {
+            return false;
+        }
+        for (int i = 1; i < method.length(); i++) {
+            char c = method.charAt(i);
+            if (!(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') && c != '-' && c != '_') {
+                return false;
+            }
+        }
+        return true;
     }
     
     /**
@@ -497,9 +501,20 @@ public class HeaderLines extends ArrayList<ByteBuffer> {
             throw new IllegalArgumentException("Invalid HTTP method: " + method);
         }
 
+        // Exactly two spaces: with the rest lumped into the version, "GET /a /../b HTTP/1.1" would
+        // be routed as /a and could be served as something else.
+        if (!"HTTP/1.1".equals(version) && !"HTTP/1.0".equals(version)) {
+            throw new IllegalArgumentException("Invalid request line: unsupported or malformed version");
+        }
+        // HTTP/1.0 has no Transfer-Encoding: a backend may ignore it and read the chunks as requests.
+        if ("HTTP/1.0".equals(version) && hasHeader(HTTP.HEADER.TRANSFER_ENCODING)) {
+            throw new IllegalArgumentException("Ambiguous framing: Transfer-Encoding in an HTTP/1.0 request");
+        }
+
         // Reject malformed header syntax (obs-fold, whitespace before colon) that a backend
         // could interpret differently than this proxy — see validateHeaderSyntax() for why.
         validateHeaderSyntax();
+        validateRequestCharacters();
 
         // Reject ambiguous Content-Length/Transfer-Encoding framing before it's ever forwarded
         // upstream — the classic CL.TE/TE.CL/CL.CL request-smuggling setup.
@@ -516,6 +531,13 @@ public class HeaderLines extends ArrayList<ByteBuffer> {
         
         // Determine body stream type
         HttpStream httpStream = determineRequestBodyStreamType();
+
+        // An upgrade request is relayed without a body, so one that declares a body would leave
+        // those bytes to be read as whatever comes next on each side.
+        if (httpStream == HttpStream.WEBSOCKET
+                && (hasHeader(HTTP.HEADER.TRANSFER_ENCODING) || (contentLength != null && contentLength > 0))) {
+            throw new IllegalArgumentException("Ambiguous framing: a WebSocket upgrade request with a body");
+        }
         
         return new HttpRequest(method, path, version, host, connection, contentLength, httpStream, this);
     }
@@ -562,6 +584,51 @@ public class HeaderLines extends ArrayList<ByteBuffer> {
     }
 
     /**
+     * Rejects bytes that a backend may read differently than this proxy did: a bare CR (a line
+     * end to some servers, which would turn one checked line into two unchecked ones), NUL, and
+     * field names with anything other than visible ASCII (a header this proxy did not recognize
+     * but the backend does). Requests only.
+     * @throws IllegalArgumentException if the request holds such a byte
+     */
+    private void validateRequestCharacters() {
+        for (int i = 0; i < size(); i++) {
+            byte[] buf = get(i).getBuffer();
+            int len = get(i).getLength();
+            boolean inName = i > 0;
+            for (int j = 0; j < len; j++) {
+                byte b = buf[j];
+                if (b == '\r' || b == 0) {
+                    throw new IllegalArgumentException("Malformed request: CR or NUL inside a line");
+                }
+                if (i == 0 && b >= 0 && b < 0x20) {
+                    throw new IllegalArgumentException("Malformed request: control character in the request line");
+                }
+                if (!inName) continue;
+                if (b == ':') {
+                    inName = false;
+                } else if (b <= 0x20 || b >= 0x7f) { // also every byte above ASCII, which is negative here
+                    throw new IllegalArgumentException("Malformed header: invalid character in field-name");
+                }
+            }
+        }
+    }
+
+    private static boolean isDigits(String value) {
+        if (value == null || value.isEmpty()) return false;
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) < '0' || value.charAt(i) > '9') return false;
+        }
+        return true;
+    }
+
+    private static boolean isAscii(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) >= 0x80) return false;
+        }
+        return true;
+    }
+
+    /**
      * Rejects a request whose Content-Length/Transfer-Encoding framing is ambiguous. A
      * conforming client never needs to send more than one Content-Length header, both
      * Content-Length and Transfer-Encoding together, or a Transfer-Encoding value other than
@@ -587,11 +654,11 @@ public class HeaderLines extends ArrayList<ByteBuffer> {
                 // ">= 0" check in determine*BodyStreamType(), silently downgrading a request/response
                 // that actually has a body to HttpStream.NONE — desynchronizing this keep-alive
                 // connection's framing from here on. Reject it outright instead.
-                if (clColon < len - 1) {
-                    Long clValue = trimHeaderValueAsLong(buf, len, clColon + 1);
-                    if (clValue == null || clValue < 0) {
-                        throw new IllegalArgumentException("Ambiguous framing: invalid Content-Length value");
-                    }
+                // Digits only: a sign or an empty value is parsed differently from server to
+                // server (the null check catches a number too large for a long).
+                if (!isDigits(trimHeaderValueAsString(buf, len, clColon + 1))
+                        || trimHeaderValueAsLong(buf, len, clColon + 1) == null) {
+                    throw new IllegalArgumentException("Ambiguous framing: invalid Content-Length value");
                 }
                 continue;
             }
@@ -614,7 +681,8 @@ public class HeaderLines extends ArrayList<ByteBuffer> {
         if (contentLengthCount > 0 && transferEncodingCount > 0) {
             throw new IllegalArgumentException("Ambiguous framing: Content-Length and Transfer-Encoding both present");
         }
-        if (transferEncodingCount > 0 && (transferEncodingValue == null || !"chunked".equalsIgnoreCase(transferEncodingValue))) {
+        if (transferEncodingCount > 0 && (transferEncodingValue == null || !isAscii(transferEncodingValue) // equalsIgnoreCase alone takes U+212A for "k"
+                || !"chunked".equalsIgnoreCase(transferEncodingValue))) {
             throw new IllegalArgumentException("Ambiguous framing: unsupported Transfer-Encoding value '" + transferEncodingValue + "'");
         }
     }

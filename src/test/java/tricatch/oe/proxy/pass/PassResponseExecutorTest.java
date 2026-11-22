@@ -29,6 +29,7 @@ class PassResponseExecutorTest {
         HttpStreamWriter clientOut = new HttpStreamWriter(rawOut);
 
         PassRequestExecutor passRequestExecutor = new PassRequestExecutor(null, 5000, 5000);
+        passRequestExecutor.setAwaitingResponse(true);
         PassResponseExecutor executor = new PassResponseExecutor(passRequestExecutor, serverIn, clientOut, 0L);
 
         executor.run();

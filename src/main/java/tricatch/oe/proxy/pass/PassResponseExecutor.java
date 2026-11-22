@@ -69,10 +69,17 @@ public class PassResponseExecutor implements Stopable {
                 // Fresh buffer per response: queued HttpEvent serializes async; reusing one HeaderLines lets the next readHeaders(clear) wipe it first.
                 HeaderLines responseHeaders = new HeaderLines(HTTP.INIT_HEADER_LINES);
 
+                awaitResponseStart();
+
                 //read-res-header
                 bytesRead = serverIn.readHeaders(responseHeaders, HTTP.MAX_HEADER_LENGTH);
 
                 this.rid = this.passRequestExecutor.getRid();
+
+                // Nobody to answer: a replaced target, or the upstream ending an idle keep-alive
+                // connection (a close, or an unsolicited 408). Bytes written now would be taken
+                // for the answer to the client's next request.
+                if (endIfNoRequestIsWaiting()) return;
 
                 if (bytesRead == -1) {
                     logger.warn("{}, No headers received from server"
@@ -103,6 +110,23 @@ public class PassResponseExecutor implements Stopable {
                     );
                 }
 
+                // An interim response (100, 103, ...) is only passed on: it neither answers the request
+                // nor releases the request thread. 101 is final for HTTP and handled below.
+                int status = response.getStatusCode();
+                if (status >= 100 && status < 200 && status != 101) {
+                    clientOut.writeHeaders(responseHeaders);
+                    continue;
+                }
+
+                // Only a WebSocket that was asked for may switch protocols. After any other 101 the
+                // two sides would disagree on whether this connection still carries HTTP.
+                boolean upgrade = status == 101;
+                if (upgrade && !(passRequestExecutor.isWebSocketRequest() && response.getBodyStream() == HttpStream.WEBSOCKET)) {
+                    logger.warn("{}, upstream switched protocols without a matching WebSocket request", rid);
+                    writeBadGatewayIfPossible(null);
+                    return;
+                }
+
                 // Enqueue RES header HttpEvent — tagged by resolved owner identifier, not raw
                 // client IP, so two accounts sharing an egress IP can't see each other's live
                 // traffic in the monitor (see ReverseProxyServer.resolveIdentifier()). Skipped
@@ -129,15 +153,19 @@ public class PassResponseExecutor implements Stopable {
                     return;
                 }
 
-                if (HttpStream.WEBSOCKET != response.getBodyStream()) {
-                    // Undo the eager timeout widening PassRequestExecutor applies as soon as it
-                    // merely sees an Upgrade: websocket request header, since this response shows
-                    // the upgrade wasn't actually confirmed.
+                if (!upgrade) {
                     passRequestExecutor.restoreConfiguredSoTimeout();
                 }
 
                 clientOut.writeHeaders(responseHeaders);
                 responseHeaderSent = true;
+
+                if (upgrade) {
+                    passRequestExecutor.startWebSocket();
+                    RelayBody.relayResponseBody(ownerIdentifier, rid, HttpStream.Flow.RES, response, serverIn, clientOut, monitored);
+                    passRequestExecutor.endWebSocketFromUpstream();
+                    return;
+                }
 
                 // Relay response body to client
                 HttpStream.Connection connection = RelayBody.relayResponseBody(ownerIdentifier, rid, HttpStream.Flow.RES, response, serverIn, clientOut, monitored);
@@ -145,20 +173,25 @@ public class PassResponseExecutor implements Stopable {
                     passRequestExecutor.setStop(true);
                 }
 
-                if( passRequestExecutor.isStop()
-                    || response.shouldCloseConnection()
-                ){
-                    break;
-                }
+                boolean closing = passRequestExecutor.isStop() || response.shouldCloseConnection();
+                // stop first: the request thread may read both as soon as awaitingResponse turns false.
+                if (closing) passRequestExecutor.setStop(true);
+                passRequestExecutor.setAwaitingResponse(false);
+                if (closing) break;
 
                 LockSupport.unpark(this.passRequestExecutor.getThread());
             }
 
         } catch (SocketTimeoutException e) {
+            if (endIfNoRequestIsWaiting()) return;
             logger.error(this.passRequestExecutor.getUid() + ", " + e.getMessage());
             if (!responseHeaderSent) writeGatewayTimeoutIfPossible();
         } catch (SocketException e){
-            if( "Connection reset".equals(e.getMessage())
+            if (endIfNoRequestIsWaiting()) return;
+            if (responseHeaderSent) {
+                // Usually the client left in the middle of the body.
+                logger.debug("{}, relay ended: {}", this.passRequestExecutor.getUid(), e.getMessage());
+            } else if( "Connection reset".equals(e.getMessage())
                 || "Socket closed".equals(e.getMessage())
             ) {
                 logger.error(this.passRequestExecutor.getUid() + ", " + e.getMessage());
@@ -167,6 +200,7 @@ public class PassResponseExecutor implements Stopable {
             }
             if (!responseHeaderSent) writeBadGatewayIfPossible(e);
         } catch (IOException e) {
+            if (endIfNoRequestIsWaiting()) return;
             logger.error( this.passRequestExecutor.getUid() + ", " + e.getMessage(), e);
             if (!responseHeaderSent) writeBadGatewayIfPossible(e);
         } catch (IllegalArgumentException e) {
@@ -181,12 +215,46 @@ public class PassResponseExecutor implements Stopable {
             if( logger.isDebugEnabled() ){
                 logger.debug( "{}, vtEnd", this.passRequestExecutor.getUid() );
             }
-            if (passRequestExecutor.getChildThread() == this.thisThread) {
+            // By generation, not by getChildThread(): that still names this thread while its
+            // replacement is connecting, and not yet while this one is only just being started.
+            if (isCurrentGeneration()) {
                 passRequestExecutor.setStop(true);
                 LockSupport.unpark(this.passRequestExecutor.getThread());
             }
         }
 
+    }
+
+    /**
+     * Waits for the first byte of the next response, with the read timeout counted from when the
+     * request was last being sent - see PassRequestExecutor.remainingResponseWait().
+     */
+    private void awaitResponseStart() throws IOException {
+        boolean shortened = false;
+        while (true) {
+            try {
+                serverIn.awaitData();
+                break;
+            } catch (SocketTimeoutException e) {
+                int left = isCurrentGeneration() ? passRequestExecutor.remainingResponseWait() : 0;
+                if (left == 0) throw e;
+                passRequestExecutor.setServerSoTimeout(left);
+                shortened = true;
+            }
+        }
+        if (shortened) passRequestExecutor.setServerSoTimeout(passRequestExecutor.getServerReadTimeout());
+    }
+
+    /**
+     * Ends this thread's part when no request is waiting on its upstream connection.
+     * @return true when there is nothing left to relay or report
+     */
+    private boolean endIfNoRequestIsWaiting() {
+        if (!isCurrentGeneration()) return true; // superseded: the client belongs to the newer generation
+        if (passRequestExecutor.isAwaitingResponse()) return false;
+        logger.debug("{}, upstream ended an idle connection", this.rid);
+        passRequestExecutor.closeIdleClient();
+        return true;
     }
 
     // Called when the upstream connection fails/times out before any response headers were

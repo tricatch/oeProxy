@@ -9,7 +9,7 @@
 
 ```kotlin
 dependencies {
-    implementation("io.github.tricatch:oe-proxy:0.3.0")
+    implementation("io.github.tricatch:oe-proxy:0.3.1")
 }
 ```
 
@@ -53,6 +53,95 @@ ReverseProxyServer.setBindAddress(InetAddress.getLoopbackAddress()); // null이�
 ```java
 ReverseProxyServer.setBindAddresses(InetAddress.getLoopbackAddress(), InetAddress.getByName("192.168.1.23"));
 ```
+
+## vhost에 없는 도메인의 기본 경로 (`DefaultRouteResolver`, 0.3.1부터)
+
+vhost에 없는 도메인을 어디로 보낼지 임베딩 애플리케이션이 정할 수 있습니다. 포워드 프록시가 CONNECT
+터널의 목적지를 이 프록시로 바꾸면, oe-proxy가 TLS를 종료하고 실제 서버에 HTTPS로 다시 접속하므로
+트래픽 이벤트로 내용을 볼 수 있습니다. 기본값은 미등록이며, 이때는 vhost만 처리합니다.
+
+```java
+// 단일 오너: 식별 헤더가 없는 요청도 이 오너로 처리
+ReverseProxyServer.setDefaultOwner(0L);
+// 공인 주소로 나가려면 꺼야 합니다 (기본값은 내부망만 허용)
+ReverseProxyServer.setInternalOnlyUpstream(false);
+
+ReverseProxyServer.setDefaultRouteResolver(host -> {
+    if (!enabled || excluded(host)) return null;          // null이면 처리하지 않음 (404)
+    String ip = hostsFileIp(host);                        // 없으면 null
+    return new DefaultRoute(ip != null ? ip : host, 443, 300_000);
+});
+
+ReverseProxyServer.setDefaultRouteResolver(null);         // 해제
+```
+
+`DefaultRoute(connectHost, port, readTimeoutMs)`에서 `connectHost`는 접속할 이름이나 IP입니다. 요청한
+도메인과 달라도 SNI와 인증서 검증에는 요청한 도메인을 씁니다. `readTimeoutMs`가 `0`이면 프록시에 설정된
+읽기 타임아웃(기본 30초)을 씁니다.
+
+처리 순서:
+
+| 상황 | 결과 |
+| --- | --- |
+| 도메인이 vhost에 있음 | vhost대로 처리. 맞는 경로가 없으면 404이며 기본 경로로 넘기지 않음 |
+| vhost 목록을 읽지 못함(로더 예외, 잘못된 YAML) | 503. 개발 서버로 갈 요청이 실제 사이트로 새지 않도록 기본 경로로 넘기지 않음 |
+| vhost에 없거나 켜진 vhost가 하나도 없음 | 아래 규칙을 통과하면 resolver가 정한 곳으로 중계 |
+
+라이브러리가 강제하는 규칙(끌 수 없음):
+
+- **루프백 클라이언트만** 쓸 수 있습니다. 그 밖의 주소에서 온 요청은 resolver가 없을 때와 같이 404 또는
+  503을 받습니다.
+- **Host와 SNI가 같아야** 합니다. 다르면 421입니다. keep-alive 연결의 요청마다 검사합니다.
+- CONNECT 메서드, 절대 URL 형식의 요청 대상, 여러 개의 Host 헤더는 400입니다.
+- **목적지가 이 프록시 자신이면** 404입니다.
+- **업스트림 인증서는 항상 검증**합니다. `trustInternalCertEnabled`는 적용되지 않으며, 신뢰 저장소는
+  JVM의 cacerts입니다. 자체 서명 서버는 502가 되므로 vhost로 등록해서 쓰십시오.
+- `internalOnlyUpstream`은 그대로 적용됩니다.
+
+사용할 때 주의할 점:
+
+- 이 PC에서 프록시로 중계하는 프로그램(포워드 프록시 등)을 거친 요청은 모두 루프백 클라이언트로
+  보입니다. 어떤 기기를 들일지는 그 프로그램이 정해야 합니다.
+- CONNECT의 목적지는 프록시에 전달되지 않고 SNI와 Host로만 알 수 있습니다. IP 주소, 밑줄(`_`)이 든 이름
+  등 SNI로 쓸 수 없는 대상과 443이 아닌 포트는 이 프록시로 보내지 말고 터널 그대로 두십시오.
+- resolver는 해당 요청마다 호출되므로 빨리 돌아와야 합니다. 켜진 vhost가 없으면
+  `VirtualHostsLoader`도 요청마다 호출됩니다.
+- HTTP/1.1로만 중계하므로 gRPC는 쓸 수 없습니다. 클라이언트 인증서가 필요한 서버와 인증서를 고정한
+  앱도 중계할 수 없으니 제외하십시오.
+- 이름이 여러 주소로 해석되면 첫 주소로만 접속합니다.
+
+## 요청 처리 규칙과 한도 (0.3.1부터)
+
+vhost와 기본 경로에 공통으로 적용됩니다.
+
+| 항목 | 동작 |
+| --- | --- |
+| Host 매칭 | 적힌 그대로를 먼저 찾고, 없으면 대소문자, 기본 포트(`:443`), 끝의 점을 무시하고 찾음 |
+| 헤더 한도 | 한 줄 64KB, 전체 256KB, 1000줄. 넘으면 요청은 연결을 닫고, 응답은 502 |
+| 메서드 | 대문자로 된 토큰(32자 이하). `PROPFIND` 같은 확장 메서드 포함 |
+| 프로토콜 | 요청 줄의 버전은 `HTTP/1.1`, `HTTP/1.0`만 허용 |
+| 모호한 요청 | 줄 안의 CR·NUL, 요청 줄의 제어문자, 잘못된 헤더 이름, 부호가 있거나 빈 `Content-Length`, HTTP/1.0의 `Transfer-Encoding`은 400 |
+| chunked 본문 | 크기 줄이나 trailer 안에 CR이 있으면 전달하지 않고 연결 종료 |
+| 1xx 응답 | 100, 103 등은 그대로 전달. 요청의 최종 응답으로 세지 않음 |
+| WebSocket | 업스트림이 101로 승인한 뒤에만 프레임 중계. 본문이 있는 업그레이드 요청은 400, 요청하지 않은 101과 WebSocket이 아닌 101은 502 |
+| WebSocket 종료 | 한쪽이 끝나면 반대쪽을 최대 1초 기다린 뒤 닫음. 어느 방향이든 5분 동안 데이터가 없으면 닫음 |
+| 읽기 타임아웃 | 응답 시작은 요청을 마지막으로 보낸 시점부터 셈. 연결이 유휴였던 시간과 업로드가 진행 중인 시간은 포함하지 않음 |
+| 유휴 연결 | 업스트림이 닫으면 클라이언트 연결도 응답 없이 닫음 |
+
+## 0.3.0에서 올릴 때
+
+API는 추가만 있으며, 동작은 다음이 달라집니다.
+
+- **보안 수정이 포함되어 있습니다. 0.3.0 이하는 0.3.1로 올려 주세요.**
+- 위 표의 "모호한 요청", "chunked 본문", "WebSocket", "헤더 한도" 규칙에 맞지 않는 요청은 이제 전달하지 않습니다.
+- keep-alive 중 목적지가 바뀔 때의 응답 유실, 본문보다 먼저 온 응답에서의 멈춤, 유휴 연결에 끼어들던
+  502, 잘못 계산되던 504, 업스트림 HTTPS 소켓 누수, 길이 없는 스트림(SSE 등)의 전달 지연을 고쳤습니다.
+- JDK 25에서 실패하던 TLS 1.2 재접속을 고쳤습니다. JDK 25에서는 세션을 재사용하지 않고 전체 핸드셰이크를
+  다시 합니다.
+- 64자를 넘는 도메인의 인증서를 발급합니다(`gotpache-keytool` 0.1.1). 기존 CA는 다시 만들 필요가 없습니다.
+- 대소문자나 `:443`만 달라 404이던 Host가 vhost에 매칭됩니다.
+- 1xx 응답(101 제외)은 `RES_HEADER` 이벤트를 만들지 않습니다.
+- 정상적인 연결 종료는 DEBUG, 클라이언트와의 TLS 핸드셰이크 실패는 스택 없는 WARN으로 기록합니다.
 
 ## 오너 식별 헤더
 
@@ -125,6 +214,8 @@ HttpEventManager.getInstance().removeEventConsumer(consumer);
 - `process()`가 예외를 던지면 그 채널만 구독이 해제되고, 같은 오너의 다른 채널은 영향받지 않습니다.
 - 이벤트 종류(`HttpEventType`): `REQ_HEADER`, `REQ_BODY`, `RES_HEADER`, `RES_BODY`, `WS_FRAME`.
   `event.getRid()`가 같은 요청/응답 이벤트를 묶는 요청 id입니다.
+  요청 하나에 `RES_HEADER`는 최종 응답(또는 WebSocket의 101) 한 번입니다. 100, 103 같은 중간 응답은
+  이벤트가 없습니다.
 - 헤더 이벤트(`REQ_HEADER`, `RES_HEADER`)는 `event.getHttpStream()`으로 본문 전송 방식
   (`NONE`, `CONTENT_LENGTH`, `CHUNKED`, `UNTIL_CLOSE`, `WEBSOCKET` 등)를 함께 전달합니다.
   `NONE`/`NULL`이면 이어지는 `REQ_BODY`/`RES_BODY` 이벤트가 오지 않으므로 기다릴 필요가 없습니다.
@@ -145,18 +236,25 @@ HttpEventManager.getInstance().removeEventConsumer(consumer);
 존재하면, 해당 애플리케이션의 `settings.gradle.kts`가 `includeBuild`로 이 프로젝트를 직접
 빌드에 포함시켜 Maven Central에 게시되기 전에도 최신 소스로 개발할 수 있습니다.
 
+같은 방식으로 이 프로젝트는 형제 디렉터리 `../gotpache-keytool`이 있으면 그 소스를 빌드에 포함하고,
+없으면 Maven Central의 `io.github.tricatch:gotpache-keytool`을 씁니다. 따라서 아직 게시되지 않은 keytool
+버전을 참조하는 동안에는 그 디렉터리가 있어야 빌드됩니다.
+
 ### 빌드 결과물
 
 `./gradlew build`는 `build/libs/`에 서로 용도가 다른 두 개의 jar를 만듭니다:
 
-- `oe-proxy-0.3.0.jar` - 의존성 미포함, 라이브러리용. 이 프로젝트 자신의 클래스만 담고 있으며
+- `oe-proxy-0.3.1.jar` - 의존성 미포함, 라이브러리용. 이 프로젝트 자신의 클래스만 담고 있으며
   의존성은 POM(또는 Gradle module metadata)을 통해 해석됩니다. Maven Central에 게시되는
   대상은 이 jar 하나뿐입니다.
-- `oe-proxy-0.3.0-all.jar` - 모든 런타임 의존성(slf4j-simple 포함)을 담은 자체 실행형(fat)
-  jar. 다른 어떤 것도 클래스패스에 없어도 `java -jar oe-proxy-0.3.0-all.jar`만으로 독립
+- `oe-proxy-0.3.1-all.jar` - 모든 런타임 의존성(slf4j-simple 포함)을 담은 자체 실행형(fat)
+  jar. 다른 어떤 것도 클래스패스에 없어도 `java -jar oe-proxy-0.3.1-all.jar`만으로 독립
   실행(standalone) CLI를 바로 쓸 수 있습니다 - 아래 "독립 실행" 절 참고.
 
 ## 배포 (Maven Central)
+
+새 `gotpache-keytool` 버전을 참조한다면 **keytool을 먼저** 게시한 뒤 이 라이브러리를 게시합니다. 게시한 뒤
+`../gotpache-keytool`이 없는 환경에서 빌드되는지 확인하십시오.
 
 Maven Central(Central Portal) 게시는 vanniktech `com.vanniktech.maven.publish` 플러그인으로 구성되어
 있습니다. 아래 키를 `~/.gradle/gradle.properties`에 설정합니다 (값은 저장소에 절대 커밋하지 않습니다):
@@ -326,12 +424,12 @@ build/install/oe-proxy/bin/oe-proxy run ./routes.yml
 
 ### 4. `java -jar`로 직접 실행
 
-`./gradlew installDist` 없이, 위 "빌드 결과물"의 `oe-proxy-0.3.0-all.jar` 하나만으로도 동일하게
+`./gradlew installDist` 없이, 위 "빌드 결과물"의 `oe-proxy-0.3.1-all.jar` 하나만으로도 동일하게
 동작합니다 (slf4j-simple을 포함한 모든 의존성이 이미 jar 안에 들어 있습니다):
 
 ```bash
-java -Djava.net.preferIPv4Stack=true -jar build/libs/oe-proxy-0.3.0-all.jar ca ./conf
-java -Djava.net.preferIPv4Stack=true -jar build/libs/oe-proxy-0.3.0-all.jar run ./conf/routes.sample.yml
+java -Djava.net.preferIPv4Stack=true -jar build/libs/oe-proxy-0.3.1-all.jar ca ./conf
+java -Djava.net.preferIPv4Stack=true -jar build/libs/oe-proxy-0.3.1-all.jar run ./conf/routes.sample.yml
 ```
 
 `-Djava.net.preferIPv4Stack=true`는 `installDist`로 만든 시작 스크립트가 항상 전달하는 옵션과

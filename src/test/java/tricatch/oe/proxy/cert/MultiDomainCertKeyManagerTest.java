@@ -152,6 +152,16 @@ class MultiDomainCertKeyManagerTest {
     }
 
     @Test
+    void noHandshakeSessionYet_offersNoCertificate() throws Exception {
+        // JDK 25 asks for an alias while it restores a TLS 1.2 session ticket, before a handshake
+        // session exists. "None" makes it fall back to a full handshake; throwing fails the handshake.
+        CertificateKeyPair root = new RootCertificateCreator().generateRootCertificate("test-root-ca");
+        MultiDomainCertKeyManager manager = new MultiDomainCertKeyManager(root.getCertificate(), root.getPrivateKey());
+
+        assertThat(manager.chooseServerAlias("RSA", null, new FakeSslSocket(null))).isNull();
+    }
+
+    @Test
     void noSniHandshake_failsGracefully_withoutThrowingOutOfChooseServerAlias() throws Exception {
         // SSLCertificateCreator can't build a certificate for a null domain (BouncyCastle rejects
         // a null SAN, and only after generating a full RSA key pair). A handshake without SNI must

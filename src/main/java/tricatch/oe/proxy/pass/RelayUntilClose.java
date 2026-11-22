@@ -53,6 +53,9 @@ public class RelayUntilClose {
             }
 
             out.write(buffer, 0, bytesRead);
+            // read() returns what has arrived, so this is usually a stream (SSE): pass it on at
+            // once instead of when the write buffer fills up.
+            out.flush();
             totalBytesRelayed += bytesRead;
 
             if (monitored) bodyCollector.add(buffer, 0, bytesRead);

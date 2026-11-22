@@ -19,21 +19,27 @@ import tricatch.oe.proxy.server.VThreadExecutor;
 import tricatch.oe.proxy.server.VirtualHosts;
 import tricatch.oe.proxy.server.VirtualPath;
 import tricatch.oe.proxy.exception.BadGatewayException;
+import tricatch.oe.proxy.exception.MisdirectedRequestException;
 import tricatch.oe.proxy.exception.NotFoundVhostException;
 import tricatch.oe.proxy.spi.ClientHints;
+import tricatch.oe.proxy.spi.DefaultRoute;
 import tricatch.oe.proxy.util.HtmlUtil;
 import tricatch.oe.proxy.util.SelfLoopOwnerRegistry;
 import tricatch.oe.proxy.util.SocketUtils;
 import tricatch.oe.proxy.util.SysUtil;
 
+import javax.net.ssl.SSLHandshakeException;
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.UnknownHostException;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -57,6 +63,10 @@ public class PassRequestExecutor implements Stopable {
     private HttpStreamReader serverIn = null;
     private HttpStreamWriter serverOut = null;
     private VirtualPath preVirtualPath = null;
+    // The default route the current server socket was opened for; null for a vhost's socket.
+    private DefaultRoute preDefaultRoute = null;
+    private String preDefaultRouteName = null;
+    private volatile int serverReadTimeout;
 
     // clientOut is handed to a spawned PassResponseExecutor as well, and a target change can
     // force-close the server socket it's blocked reading from, waking it into its own error path.
@@ -74,7 +84,23 @@ public class PassRequestExecutor implements Stopable {
     private final int connectTimeout;
     private final int readTimeout;
 
-    private boolean stop = false;
+    private volatile boolean stop = false;
+
+    // True from just before a request goes upstream until its final response has been relayed.
+    // The request loop waits on this rather than on a bare park(): a permit from unpark() can be
+    // used up by a park inside socket I/O on a virtual thread (an early response while the request
+    // body is still being sent), and park() may also return on its own.
+    // It also tells the response thread whether an upstream failure has anyone to answer.
+    private volatile boolean awaitingResponse = false;
+    private volatile long awaitingSinceNanos;
+
+    // How long one side of a WebSocket waits for the other to finish once its own direction ended,
+    // so the answer to a close frame still gets through.
+    private static final long WEBSOCKET_CLOSE_WAIT_MS = 1000;
+    // Set by the response thread for a confirmed 101. Until then nothing the client sends after an
+    // upgrade request goes upstream: after a refusal it is the next request, to be checked as one.
+    private volatile boolean upgraded = false;
+    private volatile boolean upstreamEnded = false;
 
     private Thread thisThread = null;
     private volatile Thread child = null;
@@ -110,12 +136,14 @@ public class PassRequestExecutor implements Stopable {
     // once proxyToServerConnectionSucceeded() has already run and registered this port.
     private String selfLoopIdentifierHeader = null;
     private boolean selfLoopChecked = false;
+    private volatile boolean webSocketRequest = false;
 
     public PassRequestExecutor(Socket clientSocket, int connectTimeout, int readTimeout){
 
         this.clientSocket = clientSocket;
         this.connectTimeout = connectTimeout;
         this.readTimeout = readTimeout;
+        this.serverReadTimeout = readTimeout;
     }
 
     public void setStop(boolean stop){
@@ -128,6 +156,91 @@ public class PassRequestExecutor implements Stopable {
 
     public Thread getChildThread(){
         return this.child;
+    }
+
+    boolean isAwaitingResponse(){
+        return this.awaitingResponse;
+    }
+
+    void setAwaitingResponse(boolean awaitingResponse){
+        if (awaitingResponse) this.awaitingSinceNanos = System.nanoTime();
+        this.awaitingResponse = awaitingResponse;
+    }
+
+    boolean isWebSocketRequest(){
+        return this.webSocketRequest;
+    }
+
+    /** The upstream confirmed the upgrade: both directions now relay frames. */
+    void startWebSocket() throws SocketException {
+        Socket client = this.clientSocket;
+        Socket server = this.serverSocket;
+        if (client != null) client.setSoTimeout(WEBSOCKET_IDLE_TIMEOUT_MS);
+        if (server != null) server.setSoTimeout(WEBSOCKET_IDLE_TIMEOUT_MS);
+        this.upgraded = true;
+        this.awaitingResponse = false;
+        LockSupport.unpark(this.thisThread);
+    }
+
+    /**
+     * The upstream direction of a WebSocket ended. Without this the client would learn of a
+     * backend that went away only at the idle timeout, minutes later.
+     */
+    void endWebSocketFromUpstream(){
+        this.upstreamEnded = true;
+        Thread requestThread = this.thisThread;
+        if (requestThread != null) {
+            LockSupport.unpark(requestThread);
+            try {
+                requestThread.join(WEBSOCKET_CLOSE_WAIT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        closeIdleClient();
+    }
+
+    // Waits for the flag, not for the response thread: that one is joining this one by then.
+    private void awaitUpstreamEnd(){
+        long deadline = System.nanoTime() + WEBSOCKET_CLOSE_WAIT_MS * 1_000_000;
+        for (long left; !this.upstreamEnded && (left = deadline - System.nanoTime()) > 0; ) {
+            LockSupport.parkNanos(left);
+        }
+    }
+
+    /**
+     * How much longer the response may take to start, in ms; 0 when it is overdue or no request
+     * is waiting. A socket timeout alone cannot tell: its clock starts when the response thread
+     * begins to read, which is when the previous response ended, or when an upload began.
+     */
+    int remainingResponseWait(){
+        if (!this.awaitingResponse) return 0;
+        long since = this.awaitingSinceNanos;
+        HttpStreamWriter out = this.serverOut;
+        if (out != null && out.getLastFlushNanos() - since > 0) since = out.getLastFlushNanos();
+        long left = this.serverReadTimeout - (System.nanoTime() - since) / 1_000_000;
+        // A timer may fire a few ms early; that is still "overdue".
+        return left > 20 ? (int) left : 0;
+    }
+
+    void setServerSoTimeout(int timeout) throws SocketException {
+        Socket server = this.serverSocket;
+        if (server != null) server.setSoTimeout(timeout);
+    }
+
+    int getServerReadTimeout(){
+        return this.serverReadTimeout;
+    }
+
+    /**
+     * Ends a connection with no request in flight whose upstream went away. Closing the socket is
+     * what wakes the request thread out of its blocking read for the next request.
+     */
+    void closeIdleClient(){
+        this.stop = true;
+        this.upstreamEnded = true;
+        LockSupport.unpark(this.thisThread);
+        closeQuietly(this.clientSocket, "idle clientSocket");
     }
 
     public String getUid(){
@@ -172,14 +285,12 @@ public class PassRequestExecutor implements Stopable {
         return this.socketGeneration.get();
     }
 
-    // Called by PassResponseExecutor once a response comes back that did NOT confirm a
-    // WebSocket upgrade (status other than 101), to undo the eager timeout widening applied
-    // in the request loop as soon as an Upgrade: websocket request header was merely seen —
-    // otherwise a rejected upgrade would leave this keep-alive connection running with the
-    // much longer websocket idle timeout for every later request.
+    // Called by PassResponseExecutor for every final response other than a confirmed WebSocket
+    // upgrade, so a keep-alive connection always continues on the configured timeouts (the
+    // upstream's is the default route's own when that sets one).
     public void restoreConfiguredSoTimeout() throws SocketException {
         if (this.clientSocket != null) this.clientSocket.setSoTimeout(this.readTimeout);
-        if (this.serverSocket != null) this.serverSocket.setSoTimeout(this.readTimeout);
+        if (this.serverSocket != null) this.serverSocket.setSoTimeout(this.serverReadTimeout);
     }
 
     public VirtualPath getCurrentVirtualPath(){
@@ -224,7 +335,8 @@ public class PassRequestExecutor implements Stopable {
                 int bytesRead = clientIn.readHeaders(requestHeaders, HTTP.MAX_HEADER_LENGTH);
 
                 if (bytesRead == -1) {
-                    logger.warn("{}, No headers received from client"
+                    // How every connection normally ends: the client closed it between requests.
+                    logger.debug("{}, No headers received from client"
                             , rid
                     );
                     return;
@@ -256,7 +368,12 @@ public class PassRequestExecutor implements Stopable {
                 if ((this.identifierHeader == null || this.identifierHeader.isBlank()) && this.selfLoopIdentifierHeader != null) {
                     this.identifierHeader = this.selfLoopIdentifierHeader;
                 }
-                this.virtualHosts = ReverseProxyServer.getVirtualHosts(this.clientId, this.identifierHeader);
+                try {
+                    this.virtualHosts = ReverseProxyServer.getVirtualHosts(this.clientId, this.identifierHeader);
+                } catch (NotFoundProxyVirtualHostsException e) {
+                    if (!e.isNoneConfigured() || !DefaultRouting.isAvailable(this.clientSocket)) throw e;
+                    this.virtualHosts = new VirtualHosts();
+                }
                 this.ownerIdentifier = ReverseProxyServer.resolveIdentifier(this.clientId, this.identifierHeader);
 
                 // Whether any monitor tab is watching this owner — events are tagged by resolved
@@ -280,6 +397,7 @@ public class PassRequestExecutor implements Stopable {
                 }
                 this.currentHost = httpRequest.getHost();
                 this.currentMethod = httpRequest.getMethod();
+                this.webSocketRequest = HttpStream.WEBSOCKET == httpRequest.getHttpStream();
 
                 if (logger.isDebugEnabled()) {
                     logger.debug("{}, {}, Request Headers\n{}"
@@ -300,12 +418,33 @@ public class PassRequestExecutor implements Stopable {
                     );
                 }
 
-                VirtualPath virtualPath = getVirtualPath(rid, httpRequest.getHost(), httpRequest.getPath());
+                String vhostKey = HostNames.vhostKey(this.virtualHosts, httpRequest.getHost());
+                VirtualPath virtualPath;
+                DefaultRoute defaultRoute = null;
+                if (vhostKey != null) {
+                    virtualPath = getVirtualPath(rid, vhostKey, httpRequest.getPath());
+                } else {
+                    defaultRoute = DefaultRouting.resolve(this.clientSocket, httpRequest);
+                    if (defaultRoute == null) {
+                        throw new NotFoundVhostException(httpRequest.getHost(), httpRequest.getPath(), "Undefined vhost - " + httpRequest.getHost());
+                    }
+                    virtualPath = DefaultRouting.toVirtualPath(defaultRoute);
+                }
 
                 //browser > keep-alive > route > target server
+                // A socket never moves between a vhost and the default route, even for one URL:
+                // the two verify the upstream certificate differently.
                 boolean targetChanged = preVirtualPath == null
-                        || !preVirtualPath.getTarget().toString().equals(virtualPath.getTarget().toString());
+                        || !preVirtualPath.getTarget().toString().equals(virtualPath.getTarget().toString())
+                        || !Objects.equals(preDefaultRoute, defaultRoute);
+                if (defaultRoute != null) {
+                    // Nor between two names: the certificate was verified for one of them.
+                    String name = HostNames.canonical(httpRequest.getHost());
+                    targetChanged |= !name.equals(preDefaultRouteName);
+                    preDefaultRouteName = name;
+                }
                 preVirtualPath = virtualPath;
+                preDefaultRoute = defaultRoute;
 
                 if (logger.isDebugEnabled()) {
                     logger.debug("{}, {}, targetChanged={}, targetServerSocket={}"
@@ -328,7 +467,15 @@ public class PassRequestExecutor implements Stopable {
                     //create new server socket - new target route
                     if (targetChanged && serverSocket != null) forceCloseServerSocket();
 
-                    serverSocket = createServerSocket(rid, httpRequest.getHost(), virtualPath);
+                    if (defaultRoute != null) {
+                        this.serverReadTimeout = defaultRoute.readTimeoutMs() > 0 ? defaultRoute.readTimeoutMs() : this.readTimeout;
+                        serverSocket = createDefaultRouteSocket(rid, httpRequest, virtualPath, defaultRoute);
+                    } else {
+                        this.serverReadTimeout = this.readTimeout;
+                        serverSocket = createServerSocket(rid, httpRequest.getHost(), virtualPath);
+                    }
+                    // Before the response thread starts: whatever it meets from here on answers this request.
+                    setAwaitingResponse(true);
                     serverIn = new HttpStreamReader(serverSocket.getInputStream(), HTTP.BODY_BUFFER_SIZE);
                     serverOut = new HttpStreamWriter(serverSocket.getOutputStream());
 
@@ -342,18 +489,26 @@ public class PassRequestExecutor implements Stopable {
 
                 }
 
+                setAwaitingResponse(true);
+
                 // Apply configured per-location header add/remove rules before forwarding upstream.
                 applyHeaderRules(requestHeaders, virtualPath);
 
                 //write-req-header
                 serverOut.writeHeaders(requestHeaders);
 
-                if (HttpStream.WEBSOCKET == httpRequest.getHttpStream()) {
-                    this.clientSocket.setSoTimeout(WEBSOCKET_IDLE_TIMEOUT_MS);
-                    this.serverSocket.setSoTimeout(WEBSOCKET_IDLE_TIMEOUT_MS);
+                if (this.webSocketRequest) {
+                    while (this.awaitingResponse && !this.stop) {
+                        LockSupport.park();
+                    }
+                    if (!this.upgraded) {
+                        // Refused: what follows on this connection is an ordinary request.
+                        if (this.stop) break;
+                        continue;
+                    }
                 }
 
-                // Relay request body to server if exists
+                // Relay request body to server if exists (for an upgraded connection: its frames)
                 HttpStream.Connection connection = RelayBody.relayRequestBody(this.ownerIdentifier, rid, HttpStream.Flow.REQ, httpRequest, clientIn, serverOut, this.monitored);
                 if (connection == HttpStream.Connection.CLOSE) {
                     this.stop = true;
@@ -368,10 +523,13 @@ public class PassRequestExecutor implements Stopable {
                 }
 
                 if (this.stop) {
+                    if (this.upgraded) awaitUpstreamEnd();
                     break;
                 }
 
-                LockSupport.park();
+                while (this.awaitingResponse && !this.stop) {
+                    LockSupport.park();
+                }
 
                 // PassResponseExecutor may have set stop=true (e.g. upstream read timeout) while
                 // this thread was parked; honor it now instead of blocking on the next client read
@@ -395,9 +553,13 @@ public class PassRequestExecutor implements Stopable {
                 logger.error("{}, Failed to write 502 response: {}", uid, io.getMessage(), io);
             }
         } catch (SocketTimeoutException e){
-            logger.error( uid + ", " + e.getMessage());
+            if (awaitingResponse) logger.error( uid + ", " + e.getMessage());
+            else logger.debug("{}, idle connection timed out: {}", uid, e.getMessage());
         } catch (SocketException e){
-            if( "Connection reset".equals(e.getMessage())
+            if (!awaitingResponse || stop) {
+                // Nothing in flight, or the connection was already being ended.
+                logger.debug("{}, connection closed: {}", uid, e.getMessage());
+            } else if( "Connection reset".equals(e.getMessage())
                     || "Socket closed".equals(e.getMessage())
             ) {
                 logger.error( uid + ", " + e.getMessage());
@@ -413,8 +575,22 @@ public class PassRequestExecutor implements Stopable {
             } catch (IOException io) {
                 logger.error("{}, Failed to write not-found-vhost response: {}", uid, io.getMessage(), io);
             }
+        } catch (MisdirectedRequestException e) {
+            logger.warn("{}, {}", uid, e.getMessage());
+            try {
+                if (clientOut != null && claimErrorResponse()) {
+                    HtmlUtil.writeMisdirectedRequestResponse(clientOut, e.getMessage());
+                }
+            } catch (IOException io) {
+                logger.error("{}, Failed to write 421 response: {}", uid, io.getMessage(), io);
+            }
+        } catch (SSLHandshakeException e) {
+            // Only the client's handshake gets here (the upstream's is a BadGatewayException): a
+            // connection the browser gave up, or a client that does not trust the CA. Not a fault here.
+            logger.warn("{}, TLS handshake with the client failed: {}", uid, e.getMessage());
         } catch (IOException e) {
-            logger.error(uid + ", " + e.getMessage(), e);
+            if (stop) logger.debug("{}, connection closed: {}", uid, e.getMessage());
+            else logger.error(uid + ", " + e.getMessage(), e);
         } catch (NotFoundProxyVirtualHostsException e) {
             logger.warn("{}, {}", uid, e.getMessage());
             try {
@@ -562,6 +738,26 @@ public class PassRequestExecutor implements Stopable {
         return virtualPath;
     }
 
+    private Socket createDefaultRouteSocket(String rid, HttpRequest request, VirtualPath virtualPath, DefaultRoute route) throws IOException, BadGatewayException {
+
+        String name = HostNames.canonical(request.getHost());
+        InetSocketAddress destination = new InetSocketAddress(route.connectHost(), route.port());
+        if (DefaultRouting.isThisProxy(destination)) {
+            throw new NotFoundVhostException(request.getHost(), request.getPath(), "Default route leads back to this proxy - " + request.getHost());
+        }
+
+        try {
+            if (destination.isUnresolved()) throw new UnknownHostException(route.connectHost());
+            // The address just checked, not the name: a second lookup could lead back here.
+            Socket socket = SocketUtils.createHttps(name, destination.getAddress().getHostAddress(), route.port(),
+                    this.connectTimeout, this.readTimeout, false, ReverseProxyServer.isInternalOnlyUpstream());
+            socket.setSoTimeout(this.serverReadTimeout);
+            return socket;
+        } catch (IOException e) {
+            throw new BadGatewayException(rid, request.getHost(), virtualPath.getTarget(), virtualPath.getPath(), e);
+        }
+    }
+
     private Socket createServerSocket(String rid, String vhost, VirtualPath virtualPath) throws BadGatewayException {
 
         if( logger.isDebugEnabled() ){
@@ -587,7 +783,7 @@ public class PassRequestExecutor implements Stopable {
                             , vhost
                     );
                 }
-                return SocketUtils.createHttps(vhost, target.getHost(), port, this.connectTimeout, this.readTimeout, ReverseProxyServer.isTrustInternalCertEnabled(), ReverseProxyServer.isInternalOnlyUpstream());
+                return SocketUtils.createHttps(HostNames.serverName(vhost), target.getHost(), port, this.connectTimeout, this.readTimeout, ReverseProxyServer.isTrustInternalCertEnabled(), ReverseProxyServer.isInternalOnlyUpstream());
             } else {
                 int port = target.getPort() <= 0 ? 80 : target.getPort();
                 if( logger.isDebugEnabled() ) logger.debug("{}, {}, Create HTTP {}:{} / {}"
